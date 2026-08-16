@@ -1,0 +1,19 @@
+{
+  "name": "agentguard",
+  "private": true,
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:frontend": "npm run dev --workspace=apps/frontend",
+    "dev:backend": "npm run dev --workspace=apps/backend",
+    "dev:simulator": "npm run dev --workspace=apps/simulator",
+    "build": "npm run build --workspaces --if-present",
+    "db:migrate": "npm run migrate --workspace=packages/db",
+    "seed": "npm run seed --workspace=apps/backend"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

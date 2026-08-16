@@ -1,0 +1,21 @@
+{
+  "name": "@agentguard/db",
+  "version": "0.1.0",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "migrate": "ts-node src/migrations/run.ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.0.0",
+    "pg": "^8.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/pg": "^8.11.0",
+    "ts-node": "^10.9.0",
+    "typescript": "^5.4.0"
+  }
+}
