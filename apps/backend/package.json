@@ -8,10 +8,8 @@
     "seed": "ts-node --transpile-only src/embeddings/seed.ts"
   },
   "dependencies": {
+    "@agentguard/agents": "*",
     "@agentguard/db": "*",
-    "@langchain/core": "^0.3.0",
-    "@langchain/google-genai": "^0.1.0",
-    "@langchain/langgraph": "^0.2.0",
     "@modelcontextprotocol/sdk": "^1.0.0",
     "@supabase/supabase-js": "^2.39.0",
     "cors": "^2.8.5",

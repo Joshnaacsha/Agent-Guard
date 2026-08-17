@@ -195,7 +195,8 @@ npm run dev:frontend
 | `GET` | `/api/health` | Health check |
 | `GET` | `/api/incidents` | List latest 50 incidents |
 | `POST` | `/api/incidents/simulate` | Create a single simulated incident |
-| `POST` | `/api/incidents/:id/diagnose` | Trigger concurrent diagnosis (Phase 2) |
+| `POST` | `/api/incidents/:id/diagnose` | Fire N concurrent diagnosis agents at an incident, reconcile to one CONFIRMED root cause, run the policy agent against it. Body: `{ agent_count?, reconcile?, symptom? }` |
+| `GET` | `/api/incidents/:id/diagnoses` | List every diagnosis written for an incident (PROPOSED / CONFIRMED / SUPERSEDED) |
 | `POST` | `/api/incidents/:id/remediate` | Trigger concurrent remediation (Phase 3) |
 
 ---
@@ -232,16 +233,61 @@ ORDER BY embedding <-> '[0.1, 0.2]'::vector(3072) LIMIT 3;
 | Phase | Owner | Status | What it builds |
 |---|---|---|---|
 | Phase 1 | Joshna | ✅ Complete | Shared memory foundation — DB, embeddings, simulator |
-| Phase 2 | Suba | 🔜 | Concurrent diagnosis + reconciliation transaction |
+| Phase 2 | Suba | ✅ Complete | Concurrent diagnosis + reconciliation transaction |
 | Phase 3 | Ashley | 🔜 | Concurrent remediation race + consistency checker + dashboard |
 
 ---
 
-## Key Notes for Phase 2 (Suba)
+## Verify Phase 2 Is Working
+
+```bash
+# Fire 8 concurrent diagnosis agents at one incident, twice — once siloed, once reconciled —
+# and print the proposed/confirmed/superseded contrast:
+npm run benchmark:diagnosis
+```
+
+Or against a real incident via the API:
+
+```bash
+curl -X POST http://localhost:3001/api/incidents/simulate
+# → note the incident_id, then:
+curl -X POST http://localhost:3001/api/incidents/<incident_id>/diagnose \
+  -H "Content-Type: application/json" \
+  -d '{"agent_count": 8}'
+curl http://localhost:3001/api/incidents/<incident_id>/diagnoses
+```
+
+In CockroachDB Cloud SQL Shell, confirm exactly one `CONFIRMED` diagnosis per incident:
+
+```sql
+SELECT incident_id, status, count(*) FROM diagnoses GROUP BY incident_id, status;
+```
+
+---
+
+## What Phase 2 Built
+
+- **`@agentguard/db`** (`packages/db/src/queries.ts`): `proposeDiagnosisWithReconciliation()` — the reconciliation transaction. Inside one transaction it reads whether a `CONFIRMED` diagnosis already exists for the incident, then writes the new proposal as `CONFIRMED` (none exists yet) or `SUPERSEDED` (one does). Under CockroachDB `SERIALIZABLE`, two agents racing this on the same incident can't both land `CONFIRMED` — one gets `SQLSTATE 40001` and retries via `withRetry`, and on retry correctly sees the winner and writes itself `SUPERSEDED`. `getConfirmedDiagnosis()` reads the winner back out.
+- **`@agentguard/agents`** (`packages/agents/`) — a new workspace package, published the same way `@agentguard/db` was:
+  - **`src/tools.ts`**: `search_similar_incidents` as a real LangChain `DynamicStructuredTool`, wrapping `generateEmbedding` + `searchSimilarIncidents` against `incident_memory`.
+  - **`src/diagnosisAgent.ts`**: a single diagnosis agent — pulls similar past incidents via the tool, asks Gemini for a structured `{root_cause, confidence}`, then writes through either the reconciliation path or the naive `proposeDiagnosis()` (siloed mode, for contrast).
+  - **`src/diagnosisGraph.ts`**: the LangGraph subgraph. A `Send`-based fan-out dispatches N `diagnosis_agent` branches concurrently against the same incident; an `aggregate` node tallies CONFIRMED/SUPERSEDED/PROPOSED and flips the incident to `DIAGNOSED` once a root cause is confirmed.
+  - **`src/benchmark.ts`** (`npm run benchmark:diagnosis`): runs the same incident twice — once with reconciliation disabled (siloed: N independently-"true" root causes all sit in the table), once with it enabled (exactly 1 confirmed, rest superseded) — this is the "siloed vs. shared memory" proof point.
+  - **`src/policy.ts`**: the Cost/Policy agent's approval logic — reads the current `remediation_budget` for a namespace, estimates the cost of the confirmed fix, and returns an approve/reject decision. Read-only and advisory; Phase 3's atomic claim + write-skew transaction on `remediation_budget` is what actually commits spend.
+  - **`src/embeddings/pipeline.ts`**: the Gemini embedding wrapper (moved here from Phase 1's `apps/backend/src/embeddings/pipeline.ts` so both the seed script and the diagnosis tool share one implementation).
+- **`POST /api/incidents/:id/diagnose`** and **`GET /api/incidents/:id/diagnoses`** wired in `apps/backend/src/api/routes.ts`.
+
+## Key Notes for Phase 3 (Ashley)
 
 - `incident_memory.embedding` is `VECTOR(3072)` — `gemini-embedding-001` outputs 3072 dimensions
 - Vector similarity search uses L2 distance (`<->` operator)
 - `searchSimilarIncidents(embedding, limit)` is exported from `@agentguard/db`
-- `proposeDiagnosis()` in `@agentguard/db` is a basic insert — Phase 2 replaces it with the full reconciliation transaction
 - MCP Server URL: `https://cockroachlabs.cloud/mcp` with `Authorization: Bearer <COCKROACHDB_MCP_API_KEY>`
 - All three namespace budgets are seeded: `production: $10,000`, `staging: $5,000`, `development: $2,000`
+- An incident is only `DIAGNOSED` once `runConcurrentDiagnosis()` confirms a root cause — poll/react to that status before starting the remediation race
+- `evaluateRemediationPolicy(namespace, rootCause)` from `@agentguard/agents` gives you an advisory `{approved, action, estimatedCost, availableBudget}` — reuse `estimateRemediationCost()`'s action mapping (`restart` / `rollback` / `scale-up` / `config-fix`) as the seed for what each remediation agent actually tries to execute
+- **Chat model is pinned to `gemini-2.5-flash`** in `packages/agents/src/diagnosisAgent.ts`. Google deprecates Gemini model IDs on a rolling basis (`gemini-2.0-flash` returned a hard 404 the day this was tested) — if you add your own `ChatGoogleGenerativeAI` calls in Phase 3 and get a 404, check `GET https://generativelanguage.googleapis.com/v1beta/models?key=$GOOGLE_API_KEY` for what's currently live before assuming your code is broken.
+- **If you add a new LangChain tool and `tsc` fails with `TS2589: Type instantiation is excessively deep`**: this project's TS/zod/`@langchain/core` combination chokes on `DynamicStructuredTool`'s generic inference from a `ZodObject`. Do **not** "fix" it by pinning zod below 3.25 — that resolves the type error but breaks at runtime (`@langchain/google-genai` does `require('zod/v3')`, a subpath export zod only added in 3.24+). The actual fix, used in `packages/agents/src/tools.ts`: pass an explicit param type to your `func` and cast `schema: yourSchema as any` in the constructor — no runtime change, zod still validates normally, it just stops TS from trying to unify the schema's inferred type with `func`'s signature.
+- An incident is only `DIAGNOSED` once `runConcurrentDiagnosis()` confirms a root cause — poll/react to that status before starting the remediation race
+- `evaluateRemediationPolicy(namespace, rootCause)` from `@agentguard/agents` gives you an advisory `{approved, action, estimatedCost, availableBudget}` — reuse `estimateRemediationCost()`'s action mapping (`restart` / `rollback` / `scale-up` / `config-fix`) as the seed for what each remediation agent actually tries to execute
+- **Root `package.json` pins `"overrides": { "zod": "3.23.8" }`.** Newer zod (3.25+) combined with this `@langchain/core` version makes any `DynamicStructuredTool`/`tool()` call fail TypeScript compilation with `TS2589: Type instantiation is excessively deep` — reproduced and confirmed in this repo. If you add new LangChain tools in Phase 3 and hit that error after touching dependencies, check this override is still in place before debugging your own schema.

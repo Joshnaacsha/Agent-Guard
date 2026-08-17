@@ -3,7 +3,7 @@ import { resolve } from 'path';
 config({ path: resolve(__dirname, '..', '..', '..', '..', '.env') });
 
 import { insertIncidentMemory, seedRemediationBudget } from '@agentguard/db';
-import { generateEmbedding } from './pipeline';
+import { generateEmbedding } from '@agentguard/agents';
 
 const PAST_INCIDENTS = [
   {

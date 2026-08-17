@@ -1,4 +1,5 @@
-import { getPool } from './client';
+import { getPool, withTransaction } from './client';
+import { withRetry } from './retry';
 import type {
   Incident, IncidentStatus, Diagnosis,
   AgentAction, RemediationBudget, ActionOutcome,
@@ -61,6 +62,60 @@ export async function getDiagnoses(incidentId: string): Promise<Diagnosis[]> {
     [incidentId]
   );
   return rows;
+}
+
+export interface ReconciliationResult {
+  diagnosis: Diagnosis;
+  /** true if an already-CONFIRMED diagnosis existed and this one was written as SUPERSEDED */
+  reconciled: boolean;
+  confirmedDiagnosisId: string;
+}
+
+/**
+ * The reconciliation transaction: reads whether a CONFIRMED diagnosis already exists
+ * for this incident, then writes this proposal as CONFIRMED (if none does) or SUPERSEDED
+ * (if one does) — inside the same transaction. Under CockroachDB SERIALIZABLE isolation,
+ * two agents racing this same read-then-write on the same incident_id cannot both land as
+ * CONFIRMED: one commits, the other gets SQLSTATE 40001 and must retry — on retry it
+ * observes the winner's CONFIRMED row and correctly writes itself as SUPERSEDED. This is
+ * what turns "two agents disagree" into "one confirmed root cause", not a plain race.
+ */
+export async function proposeDiagnosisWithReconciliation(
+  incidentId: string,
+  agentId: string,
+  rootCause: string,
+  confidence: number
+): Promise<ReconciliationResult> {
+  return withRetry(() =>
+    withTransaction(async (client) => {
+      const { rows: confirmed } = await client.query<Diagnosis>(
+        `SELECT * FROM diagnoses WHERE incident_id = $1 AND status = 'CONFIRMED' LIMIT 1`,
+        [incidentId]
+      );
+
+      const status = confirmed.length > 0 ? 'SUPERSEDED' : 'CONFIRMED';
+
+      const { rows } = await client.query<Diagnosis>(
+        `INSERT INTO diagnoses (incident_id, agent_id, root_cause, confidence, status)
+         VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+        [incidentId, agentId, rootCause, confidence, status]
+      );
+
+      return {
+        diagnosis: rows[0],
+        reconciled: status === 'SUPERSEDED',
+        confirmedDiagnosisId: confirmed[0]?.diagnosis_id ?? rows[0].diagnosis_id,
+      };
+    })
+  );
+}
+
+export async function getConfirmedDiagnosis(incidentId: string): Promise<Diagnosis | null> {
+  const { rows } = await getPool().query<Diagnosis>(
+    `SELECT * FROM diagnoses WHERE incident_id = $1 AND status = 'CONFIRMED' LIMIT 1`,
+    [incidentId]
+  );
+  return rows[0] ?? null;
 }
 
 export async function logAgentAction(
