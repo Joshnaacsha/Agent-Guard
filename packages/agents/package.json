@@ -6,7 +6,8 @@
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
-    "benchmark:diagnosis": "ts-node --transpile-only src/benchmark.ts"
+    "benchmark:diagnosis": "ts-node --transpile-only src/benchmark.ts",
+    "benchmark:remediation": "ts-node --transpile-only src/remediationBenchmark.ts"
   },
   "dependencies": {
     "@agentguard/db": "*",

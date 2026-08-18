@@ -162,6 +162,93 @@ export async function insertIncidentMemory(
   return rows[0];
 }
 
+export async function getAgentActions(incidentId: string): Promise<AgentAction[]> {
+  const { rows } = await getPool().query<AgentAction>(
+    `SELECT * FROM agent_actions WHERE incident_id = $1 ORDER BY created_at ASC`,
+    [incidentId]
+  );
+  return rows;
+}
+
+export async function listRemediationBudgets(): Promise<RemediationBudget[]> {
+  const { rows } = await getPool().query<RemediationBudget>(`SELECT * FROM remediation_budget`);
+  return rows;
+}
+
+/**
+ * The atomic claim transaction (Phase 3): a single conditional UPDATE that only succeeds if
+ * the incident is still DIAGNOSED. Under concurrent load N agents can issue this against the
+ * same incident_id; CockroachDB serializes them so at most one UPDATE's WHERE clause matches
+ * and returns a row — every other agent's statement simply updates 0 rows (not an error, no
+ * retry needed) because by the time it runs the status column has already moved off DIAGNOSED.
+ * This is what prevents two remediation agents from both acting on the same incident.
+ */
+export async function claimIncidentForRemediation(incidentId: string): Promise<Incident | null> {
+  return withRetry(async () => {
+    const { rows } = await getPool().query<Incident>(
+      `UPDATE incidents SET status = 'REMEDIATING', version = version + 1
+       WHERE incident_id = $1 AND status = 'DIAGNOSED' RETURNING *`,
+      [incidentId]
+    );
+    return rows[0] ?? null;
+  });
+}
+
+export async function resolveIncident(incidentId: string): Promise<Incident> {
+  const { rows } = await getPool().query<Incident>(
+    `UPDATE incidents SET status = 'RESOLVED', version = version + 1
+     WHERE incident_id = $1 RETURNING *`,
+    [incidentId]
+  );
+  return rows[0];
+}
+
+export interface BudgetClaimResult {
+  success: boolean;
+  remainingBudget: number;
+}
+
+/**
+ * The budget write-skew transaction (Phase 3): reads the current namespace budget, decides
+ * whether the proposed spend fits, then writes the deduction — all inside one transaction.
+ * When multiple agents concurrently draw against the same namespace's budget, CockroachDB
+ * SERIALIZABLE isolation means only non-conflicting reads/writes commit cleanly; overlapping
+ * draws produce a real SQLSTATE 40001 that `withRetry` catches and retries — on retry the
+ * agent re-reads the (now lower) budget and re-decides, so no draw can ever push the budget
+ * negative and no double-spend can be silently committed. `onRetry` lets callers log each
+ * genuine 40001 conflict to `agent_actions` for the audit trail.
+ */
+export async function claimRemediationBudget(
+  namespace: string,
+  amount: number,
+  onRetry?: (attempt: number) => void
+): Promise<BudgetClaimResult> {
+  return withRetry(
+    () =>
+      withTransaction(async (client) => {
+        const { rows } = await client.query<RemediationBudget>(
+          `SELECT * FROM remediation_budget WHERE namespace = $1`,
+          [namespace]
+        );
+        const currentBudget = Number(rows[0]?.budget ?? 0);
+
+        if (currentBudget < amount) {
+          return { success: false, remainingBudget: currentBudget };
+        }
+
+        const { rows: updated } = await client.query<RemediationBudget>(
+          `UPDATE remediation_budget SET budget = budget - $2
+           WHERE namespace = $1 RETURNING *`,
+          [namespace, amount]
+        );
+
+        return { success: true, remainingBudget: Number(updated[0].budget) };
+      }),
+    5,
+    onRetry
+  );
+}
+
 export async function searchSimilarIncidents(
   embedding: number[],
   limit = 5

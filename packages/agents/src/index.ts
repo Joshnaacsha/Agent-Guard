@@ -15,3 +15,15 @@ export { evaluateRemediationPolicy, estimateRemediationCost } from './policy';
 export type { PolicyDecision, RemediationCostEstimate, RemediationAction } from './policy';
 
 export { defaultSymptomFor } from './symptoms';
+
+export { checkClusterCapacity } from './opsAgent';
+export type { CapacityCheckResult } from './opsAgent';
+
+export { runRemediationAgent } from './remediationAgent';
+export type { RemediationAgentInput, RemediationAgentResult } from './remediationAgent';
+
+export { remediationGraph, runConcurrentRemediation } from './remediationGraph';
+export type { RemediationSummary, RunConcurrentRemediationOptions, RunConcurrentRemediationResult } from './remediationGraph';
+
+export { checkIncidentConsistency, checkFleetConsistency } from './consistencyChecker';
+export type { ConsistencyIssue, ConsistencyReport, FleetConsistencyReport } from './consistencyChecker';

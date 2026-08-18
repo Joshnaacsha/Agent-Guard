@@ -4,11 +4,12 @@ export {
   createIncident, getIncident, listIncidents, updateIncidentStatus,
   proposeDiagnosis, getDiagnoses,
   proposeDiagnosisWithReconciliation, getConfirmedDiagnosis,
-  logAgentAction,
-  seedRemediationBudget, getRemediationBudget,
+  logAgentAction, getAgentActions,
+  seedRemediationBudget, getRemediationBudget, listRemediationBudgets,
+  claimIncidentForRemediation, resolveIncident, claimRemediationBudget,
   insertIncidentMemory, searchSimilarIncidents,
 } from './queries';
-export type { ReconciliationResult } from './queries';
+export type { ReconciliationResult, BudgetClaimResult } from './queries';
 export type {
   Incident, Diagnosis, RemediationBudget, AgentAction, IncidentMemory,
   IncidentStatus, DiagnosisStatus, ActionOutcome,

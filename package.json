@@ -12,7 +12,8 @@
     "build": "npm run build --workspaces --if-present",
     "db:migrate": "npm run migrate --workspace=packages/db",
     "seed": "npm run seed --workspace=apps/backend",
-    "benchmark:diagnosis": "npm run benchmark:diagnosis --workspace=packages/agents"
+    "benchmark:diagnosis": "npm run benchmark:diagnosis --workspace=packages/agents",
+    "benchmark:remediation": "npm run benchmark:remediation --workspace=packages/agents"
   },
   "devDependencies": {
     "typescript": "^5.4.0"
