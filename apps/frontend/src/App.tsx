@@ -188,6 +188,7 @@ function Btn({
   const fg = variant === 'default' ? C.text : '#0d1117';
   return (
     <button
+      type="button"
       onClick={onClick}
       disabled={disabled}
       style={{
@@ -804,6 +805,7 @@ function App() {
   }
 
   async function handleLambdaInvoke(mode: LambdaFailureMode) {
+    if (lambdaBusy !== null) return; // belt-and-suspenders: the disabled attribute already blocks this
     setLambdaBusy(mode); setError(null); setLambdaResult(null);
     try {
       const res = await fetch('/api/incidents/lambda-invoke', {

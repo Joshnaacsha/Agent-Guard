@@ -5,6 +5,18 @@ exports.handler = async (event) => {
   const failureMode = event?.failureMode ?? 'healthy';
   const podName = event?.podName ?? 'unknown-pod';
   const namespace = event?.namespace ?? 'default';
+  const isVerification = event?.verify === true;
+
+  // Every invocation logs first, unconditionally — this line is what makes "the fix" visible in
+  // CloudWatch at all. UpdateFunctionConfiguration itself (the actual fix) is a control-plane
+  // API call and never appears in CloudWatch Logs — only in CloudTrail. The re-invoke the
+  // remediation agent makes right after applying a fix is tagged verify=true so it's clearly
+  // distinguishable here from an ordinary chaos-demo invoke.
+  console.log(
+    `pod-worker invoked: pod=${podName} namespace=${namespace} mode=${failureMode} ` +
+    `memoryLimitMb=${process.env.AWS_LAMBDA_FUNCTION_MEMORY_SIZE} forceHealthy=${process.env.FORCE_HEALTHY === 'true'}` +
+    (isVerification ? ' [AgentGuard fix verification re-invoke]' : '')
+  );
 
   // Set by the remediation agent via a real UpdateFunctionConfiguration call after a
   // CrashLoopBackOff diagnosis — models a hotfix deployed to the running function. If it's
@@ -12,8 +24,6 @@ exports.handler = async (event) => {
   if (process.env.FORCE_HEALTHY === 'true') {
     return { statusCode: 200, body: `${podName} healthy (FORCE_HEALTHY hotfix active)` };
   }
-
-  console.log(`pod-worker starting: pod=${podName} namespace=${namespace} mode=${failureMode}`);
 
   switch (failureMode) {
     case 'healthy':

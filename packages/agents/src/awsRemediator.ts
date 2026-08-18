@@ -40,7 +40,11 @@ async function waitForConfigUpdate(maxAttempts = 15): Promise<void> {
 async function reinvokeAndCheck(payload: Record<string, unknown>): Promise<boolean> {
   const response = await getClient().send(new InvokeCommand({
     FunctionName: FUNCTION_NAME,
-    Payload: Buffer.from(JSON.stringify(payload)),
+    // verify:true makes handler.js log this invoke as "[AgentGuard fix verification re-invoke]"
+    // instead of an ordinary chaos-demo call — otherwise it's indistinguishable in CloudWatch
+    // from a plain successful invoke, since the fix itself (an UpdateFunctionConfiguration API
+    // call) never produces a log line at all.
+    Payload: Buffer.from(JSON.stringify({ ...payload, verify: true })),
   }));
   return !response.FunctionError;
 }
