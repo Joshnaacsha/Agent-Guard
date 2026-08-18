@@ -19,7 +19,7 @@ export { defaultSymptomFor } from './symptoms';
 export { checkClusterCapacity } from './opsAgent';
 export type { CapacityCheckResult } from './opsAgent';
 
-export { applyAwsFix, isLambdaOriginatedIncident } from './awsRemediator';
+export { applyAwsFix, isLambdaOriginatedIncident, parseLambdaFailureMode } from './awsRemediator';
 export type { AwsFixResult } from './awsRemediator';
 
 export { runRemediationAgent } from './remediationAgent';

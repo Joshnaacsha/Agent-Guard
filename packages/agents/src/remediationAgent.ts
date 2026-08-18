@@ -5,7 +5,7 @@ import {
 } from '@agentguard/db';
 import { estimateRemediationCost, type RemediationAction } from './policy';
 import { checkClusterCapacity } from './opsAgent';
-import { applyAwsFix, isLambdaOriginatedIncident, type AwsFixResult } from './awsRemediator';
+import { applyAwsFix, isLambdaOriginatedIncident, parseLambdaFailureMode, type AwsFixResult } from './awsRemediator';
 
 export interface RemediationAgentInput {
   incident: Incident;
@@ -89,7 +89,12 @@ export async function runRemediationAgent(input: RemediationAgentInput): Promise
   // instead of only flipping the incident's status in the database.
   let awsFix: AwsFixResult | null = null;
   if (isLambdaOriginatedIncident(incident.pod_name)) {
-    awsFix = await applyAwsFix(action);
+    const originalFailureMode = parseLambdaFailureMode(incident.pod_name);
+    console.log(
+      `[remediationAgent ${agentId}] winning agent → applying AWS fix '${action}' ` +
+      `to Lambda (incident ${incident.incident_id}, original mode ${originalFailureMode})`
+    );
+    awsFix = await applyAwsFix(action, originalFailureMode);
     await logAgentAction(
       incident.incident_id,
       agentId,

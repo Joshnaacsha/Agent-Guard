@@ -39,11 +39,14 @@ const VALID_FAILURE_MODES: PodFailureMode[] = ['healthy', 'crash-loop', 'oom', '
 
 router.post('/incidents/lambda-invoke', async (req, res) => {
   try {
-    const podName = req.body?.pod_name ?? `lambda-pod-${Math.random().toString(36).substring(2, 8)}`;
     const namespace = req.body?.namespace ?? 'production';
     const failureMode: PodFailureMode = VALID_FAILURE_MODES.includes(req.body?.failure_mode)
       ? req.body.failure_mode
       : 'crash-loop';
+    // Encode the failure mode in the pod_name so the remediation agent can later verify the
+    // AWS-side fix against the *actual* mode that crashed (isLambdaOriginatedIncident +
+    // parseLambdaFailureMode). Prefix stays `lambda-pod-` so isLambdaOriginatedIncident matches.
+    const podName = req.body?.pod_name ?? `lambda-pod-${failureMode}-${Math.random().toString(36).substring(2, 8)}`;
 
     const invocation = await invokePodWorker(podName, namespace, failureMode);
 

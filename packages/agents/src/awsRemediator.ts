@@ -18,8 +18,26 @@ function getClient(): LambdaClient {
 // incident with no real Lambda function behind it.
 const LAMBDA_INCIDENT_PREFIX = 'lambda-pod-';
 
+// The four failure modes the pod-worker Lambda handler supports (must match handler.js).
+type LambdaFailureMode = 'healthy' | 'crash-loop' | 'oom' | 'timeout';
+const LAMBDA_FAILURE_MODES: LambdaFailureMode[] = ['healthy', 'crash-loop', 'oom', 'timeout'];
+
 export function isLambdaOriginatedIncident(podName: string): boolean {
   return podName.startsWith(LAMBDA_INCIDENT_PREFIX);
+}
+
+/**
+ * Extracts the original failure mode from a `lambda-pod-<mode>-<rand>` incident pod name
+ * (see routes.ts /incidents/lambda-invoke). Falls back to `crash-loop` when the mode is
+ * missing so an older incident row still gets a real AWS fix + verification instead of a
+ * silent no-op.
+ */
+export function parseLambdaFailureMode(podName: string): LambdaFailureMode {
+  const suffix = podName.slice(LAMBDA_INCIDENT_PREFIX.length);
+  const first = suffix.split('-')[0];
+  return LAMBDA_FAILURE_MODES.includes(first as LambdaFailureMode)
+    ? (first as LambdaFailureMode)
+    : 'crash-loop';
 }
 
 export interface AwsFixResult {
@@ -37,26 +55,52 @@ async function waitForConfigUpdate(maxAttempts = 15): Promise<void> {
   }
 }
 
-async function reinvokeAndCheck(payload: Record<string, unknown>): Promise<boolean> {
+/**
+ * Re-invokes the pod-worker Lambda with the *original* failure mode that crashed the incident
+ * — so a memory raise is verified against the real OOM invoke, a timeout raise against the
+ * real long invoke, and a hotfix env var against the real crash-loop invoke. The verify:true
+ * flag makes handler.js tag its log line as "[AgentGuard fix verification re-invoke]" so this
+ * appears distinctly in CloudWatch next to the original crash.
+ */
+async function reinvokeAndCheck(failureMode: LambdaFailureMode): Promise<boolean> {
+  const payload: Record<string, unknown> = { failureMode, verify: true };
+  if (failureMode === 'oom') payload.allocateMb = 300;
+  if (failureMode === 'timeout') payload.sleepMs = 8000;
+
   const response = await getClient().send(new InvokeCommand({
     FunctionName: FUNCTION_NAME,
-    // verify:true makes handler.js log this invoke as "[AgentGuard fix verification re-invoke]"
-    // instead of an ordinary chaos-demo call — otherwise it's indistinguishable in CloudWatch
-    // from a plain successful invoke, since the fix itself (an UpdateFunctionConfiguration API
-    // call) never produces a log line at all.
-    Payload: Buffer.from(JSON.stringify({ ...payload, verify: true })),
+    Payload: Buffer.from(JSON.stringify(payload)),
   }));
   return !response.FunctionError;
 }
 
 /**
- * Applies a real fix to the agentguard-pod-worker Lambda function based on the confirmed root
- * cause, waits for AWS to finish applying it, then re-invokes the same function with the same
- * failure mode to prove the fix actually holds. This is the "resolve directly in AWS" step —
- * remediation isn't a DB status flip, it's a genuine UpdateFunctionConfiguration call plus a
- * genuine re-invocation showing the previously-crashing call now succeeds.
+ * "Redeploy fixed code" hotfix — sets FORCE_HEALTHY=true on the running Lambda function so
+ * handler.js short-circuits any subsequent failure-mode invocation. Used for the three actions
+ * (`restart`, `rollback`, `config-fix`) that all model "the code / config is broken, ship a
+ * healthy version." UpdateFunctionConfiguration.Environment replaces the whole variable set,
+ * which is fine here — the function has no other required env vars.
  */
-export async function applyAwsFix(action: RemediationAction): Promise<AwsFixResult> {
+async function applyHotfix(): Promise<void> {
+  await getClient().send(new UpdateFunctionConfigurationCommand({
+    FunctionName: FUNCTION_NAME,
+    Environment: { Variables: { FORCE_HEALTHY: 'true' } },
+  }));
+  await waitForConfigUpdate();
+}
+
+/**
+ * Applies a real fix to the agentguard-pod-worker Lambda function based on the confirmed root
+ * cause, waits for AWS to finish applying it, then re-invokes the same function with the
+ * original failure mode to prove the fix actually holds. This is the "resolve directly in AWS"
+ * step — remediation isn't a DB status flip, it's a genuine UpdateFunctionConfiguration call
+ * plus a genuine re-invocation showing the previously-crashing call now succeeds.
+ */
+export async function applyAwsFix(
+  action: RemediationAction,
+  originalFailureMode: LambdaFailureMode
+): Promise<AwsFixResult> {
+  console.log(`[awsRemediator] applying '${action}' to ${FUNCTION_NAME} (original mode: ${originalFailureMode})`);
   try {
     switch (action) {
       case 'scale-up': {
@@ -65,7 +109,8 @@ export async function applyAwsFix(action: RemediationAction): Promise<AwsFixResu
           MemorySize: 512,
         }));
         await waitForConfigUpdate();
-        const verified = await reinvokeAndCheck({ failureMode: 'oom', allocateMb: 300 });
+        const verified = await reinvokeAndCheck(originalFailureMode);
+        console.log(`[awsRemediator] scale-up applied; verify(${originalFailureMode})=${verified}`);
         return { applied: true, detail: `Raised ${FUNCTION_NAME} MemorySize 128MB → 512MB.`, verified };
       }
 
@@ -75,24 +120,36 @@ export async function applyAwsFix(action: RemediationAction): Promise<AwsFixResu
           Timeout: 15,
         }));
         await waitForConfigUpdate();
-        const verified = await reinvokeAndCheck({ failureMode: 'timeout', sleepMs: 8000 });
+        const verified = await reinvokeAndCheck(originalFailureMode);
+        console.log(`[awsRemediator] timeout-fix applied; verify(${originalFailureMode})=${verified}`);
         return { applied: true, detail: `Raised ${FUNCTION_NAME} Timeout 5s → 15s.`, verified };
       }
 
-      case 'restart': {
-        await getClient().send(new UpdateFunctionConfigurationCommand({
-          FunctionName: FUNCTION_NAME,
-          Environment: { Variables: { FORCE_HEALTHY: 'true' } },
-        }));
-        await waitForConfigUpdate();
-        const verified = await reinvokeAndCheck({ failureMode: 'crash-loop' });
-        return { applied: true, detail: `Deployed FORCE_HEALTHY=true hotfix env var to ${FUNCTION_NAME}.`, verified };
+      case 'restart':
+      case 'rollback':
+      case 'config-fix': {
+        // All three model "the code/config is broken, ship a fixed version" — for the demo
+        // Lambda that's the same operation: flip FORCE_HEALTHY=true so handler.js short-circuits
+        // every failure mode. Distinct action labels stay in the audit log & UI.
+        await applyHotfix();
+        const verified = await reinvokeAndCheck(originalFailureMode);
+        const label =
+          action === 'restart' ? 'FORCE_HEALTHY=true hotfix env var'
+          : action === 'rollback' ? 'FORCE_HEALTHY=true rollback env var (simulates redeploy of prior-known-good image)'
+          : 'FORCE_HEALTHY=true config-fix env var (simulates missing/corrected config)';
+        console.log(`[awsRemediator] ${action} applied; verify(${originalFailureMode})=${verified}`);
+        return { applied: true, detail: `Deployed ${label} to ${FUNCTION_NAME}.`, verified };
       }
 
-      default:
-        return { applied: false, detail: `No AWS-side fix mapped for action '${action}'.`, verified: null };
+      default: {
+        const exhaustive: never = action;
+        return { applied: false, detail: `No AWS-side fix mapped for action '${exhaustive}'.`, verified: null };
+      }
     }
   } catch (err: any) {
-    return { applied: false, detail: `AWS fix failed: ${err.message ?? String(err)}`, verified: null };
+    const message = err?.message ?? String(err);
+    console.error(`[awsRemediator] '${action}' failed: ${message}`);
+    return { applied: false, detail: `AWS fix failed: ${message}`, verified: null };
   }
 }
+
