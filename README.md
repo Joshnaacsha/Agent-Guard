@@ -1,38 +1,83 @@
 # AgentGuard
-### Concurrency-Safe, Shared-Memory Incident Response for Kubernetes
-*CockroachDB × AWS Hackathon — Build with Agentic Memory*
 
-> **Tagline:** Siloed agents guess in parallel. AgentGuard's agents remember together.
+**Concurrency-safe, shared-memory incident response for Kubernetes — built on CockroachDB.**
+
+Live demo: [agent-guard-frontend-six.vercel.app](https://agent-guard-frontend-six.vercel.app)
 
 ---
 
-## What Is AgentGuard?
+## Table of Contents
 
-AgentGuard is a Kubernetes incident response system where multiple AI agents investigate pod failures and execute remediations **concurrently**, all sharing one transactional memory backed by CockroachDB.
+- [The Problem](#the-problem)
+- [The Solution](#the-solution)
+- [How It Works](#how-it-works)
+- [Architecture](#architecture)
+- [Tech Stack](#tech-stack)
+- [Project Structure](#project-structure)
+- [Prerequisites](#prerequisites)
+- [Local Setup](#local-setup)
+- [Running the App Locally](#running-the-app-locally)
+- [Deploying to Production](#deploying-to-production)
+- [API Reference](#api-reference)
+- [Verifying It Works](#verifying-it-works)
+- [Known Gotchas](#known-gotchas)
 
-The core problem it solves: when multiple agents monitor the same Kubernetes cluster independently, they duplicate work, produce contradictory diagnoses, and race to apply the same fix twice. AgentGuard prevents this by giving every agent access to the same consistent shared memory — so agents reconcile instead of collide.
+---
 
-**Two real concurrency mechanics, both demonstrated:**
+## The Problem
 
-1. **Diagnosis reconciliation** — N agents investigate the same pod failure at once. The second and third agent see what the first already found. Only one root cause is ever `CONFIRMED`; the rest are written as `SUPERSEDED`.
-2. **Remediation race** — N agents race to claim and execute a fix. CockroachDB's serializable transactions ensure only one commits; the rest are `REJECTED` with real `SQLSTATE 40001` retries logged.
+Production Kubernetes clusters are watched by more than one thing at once — multiple on-call engineers, multiple monitoring bots, increasingly multiple *AI agents* — all reacting to the same pod failures independently.
 
-Plus a real AWS chaos demo: a genuine Lambda function stands in for a pod's container process. Crashing it for real (OOM kill, timeout) creates a real incident, and remediation calls the real AWS API to fix it — then re-invokes the function to prove the fix actually holds.
+That independence is the problem. When several agents investigate and act on the same incident without a shared source of truth:
+
+- **They duplicate work.** Three agents each spend an LLM call diagnosing the same crash loop from scratch, because none of them know the others are looking too.
+- **They disagree with each other.** Agent A concludes "OOM — raise memory limit." Agent B concludes "bad deploy — roll back." Both get written down as fact. Nobody reconciles them, so the on-call human inherits the contradiction.
+- **They race to fix the same thing twice.** Two agents both decide the fix is safe and both execute it — a double rollback, a double budget spend, a double API call to a cloud provider. In distributed systems this is a classic write-skew bug, and it's exactly as dangerous when the writer is an LLM agent instead of a human clicking a button twice.
+
+Most "multi-agent" demos avoid this problem by construction — they run one agent at a time, or they let agents write to isolated, non-transactional stores (a Python dict, a JSON file, an in-memory cache) where races either can't happen or silently corrupt state without anyone noticing. That's not how real fleets of concurrent agents will actually run.
+
+## The Solution
+
+AgentGuard puts every agent's reads and writes through **one transactional shared memory in CockroachDB**, and uses CockroachDB's `SERIALIZABLE` isolation to make concurrency safety a property of the database, not a property of careful agent code.
+
+Two concrete mechanics prove this, both live in the dashboard:
+
+1. **Diagnosis reconciliation.** Fire N diagnosis agents at the same incident concurrently. Each one investigates independently (its own Gemini call, its own read of similar past incidents), but writes its conclusion through a single transaction that checks *"has anyone already confirmed a root cause for this incident?"* before deciding whether to write itself `CONFIRMED` or `SUPERSEDED`. Under `SERIALIZABLE`, two agents racing this can't both land `CONFIRMED` — the database forces one into a retry (`SQLSTATE 40001`), and on retry it correctly sees the winner and stands down. Exactly one root cause survives; the rest are recorded, not lost.
+2. **Remediation race.** Fire N remediation agents at a diagnosed incident. They race to atomically claim it (`UPDATE incidents SET status='REMEDIATING' WHERE status='DIAGNOSED'` — at most one `UPDATE` can ever match) and then race again to draw from a shared per-namespace dollar budget (a write-skew transaction: read the budget, decide if the draw fits, write the deduction, all atomically). Every loser is rejected with zero side effects; the winner executes the real fix. The budget can never go negative, and the fix can never be applied twice.
+
+On top of that, an **independent consistency checker** re-derives the truth from the tables after the fact — it never trusts what an agent claims it did, only what's actually committed. And a **real AWS Lambda chaos demo** makes the failures and fixes genuine rather than simulated: a Lambda function stands in for a pod's container process, gets crashed for real (OOM kill, timeout), and the winning remediation agent calls the real AWS API to fix it, then re-invokes the function to *prove* the fix holds — not just flip a status column.
+
+## How It Works
+
+```
+1. A pod fails (simulated event, or a real AWS Lambda crash) → an `incidents` row is created.
+2. N diagnosis agents fire concurrently, each reading similar past incidents via vector
+   search, each calling Gemini for a root-cause hypothesis, each writing through the
+   reconciliation transaction. One CONFIRMED diagnosis survives; the rest are SUPERSEDED.
+3. The Cost/Policy agent checks the confirmed fix's estimated cost against the namespace budget.
+4. N remediation agents fire concurrently, racing the atomic claim + the budget draw.
+   The winner executes the fix (a real AWS API call for Lambda-originated incidents) and
+   resolves the incident.
+5. The consistency checker audits the final state: no duplicate CONFIRMED diagnoses, no
+   duplicate committed remediations, no negative budgets.
+```
+
+Every step is visible in the dashboard's live "agent race" panel as it happens.
 
 ---
 
 ## Architecture
 
 ```
-React Frontend (Vite) — login, incident console, live agent-race visualizer
-  ↕  Supabase Auth        — login/session
-  ↕  Backend REST API     — trigger incidents, fetch state
+React Frontend (Vite, deployed on Vercel)
+  ↕ Supabase Auth          — login/session
+  ↕ Backend REST API       — trigger incidents, fetch state (VITE_API_URL)
 
-Backend (LangGraph + Express + TypeScript)
-  ↕  CockroachDB direct (@agentguard/db)  — all agent reads/writes
-  ↕  Gemini API                           — embeddings + LLM reasoning
-  ↕  ccloud CLI (opsAgent.ts)             — capacity check, shelled out for real
-  ↕  AWS Lambda SDK                       — invoke + reconfigure the real pod-worker function
+Backend (LangGraph + Express + TypeScript, deployed on Render)
+  ↕ CockroachDB direct (@agentguard/db)  — all agent reads/writes
+  ↕ Gemini API                           — embeddings + LLM reasoning
+  ↕ ccloud CLI (opsAgent.ts)             — capacity check, shelled out for real
+  ↕ AWS Lambda SDK                       — invoke + reconfigure the real pod-worker function
 
 CockroachDB (Shared Agent Memory)
      incidents           — pod failure events
@@ -41,11 +86,12 @@ CockroachDB (Shared Agent Memory)
      agent_actions       — full audit log of every agent operation
      incident_memory     — VECTOR(3072) index of past incidents for similarity search
 
-AWS Lambda (infra/lambda/pod-worker) — a real function that crashes for real (crash-loop / OOM / timeout);
-remediation issues a real UpdateFunctionConfiguration call and re-invokes it to verify the fix
+AWS Lambda (infra/lambda/pod-worker) — a real function that crashes for real
+(crash-loop / OOM / timeout); remediation issues a real UpdateFunctionConfiguration
+call and re-invokes it to verify the fix
 ```
 
-The CockroachDB Managed MCP Server is documented in `.env.example` but not wired into any running code — the two CockroachDB tools actually in use are **Distributed Vector Indexing** (`incident_memory`) and the **ccloud CLI** (`opsAgent.ts`), which clears the hackathon's "at least two" requirement without it.
+The CockroachDB Managed MCP Server is documented in `.env.example` but not wired into any running code path — the two CockroachDB mechanisms actually in use are **Distributed Vector Indexing** (`incident_memory`) and the **`ccloud` CLI** (`opsAgent.ts`).
 
 ---
 
@@ -53,12 +99,12 @@ The CockroachDB Managed MCP Server is documented in `.env.example` but not wired
 
 | Layer | Technology |
 |---|---|
-| Frontend | React 18, Vite, TypeScript |
-| Backend | Node.js, Express, LangGraph (TypeScript) |
+| Frontend | React 18, Vite, TypeScript — hosted on **Vercel** |
+| Backend | Node.js, Express, LangGraph (TypeScript) — hosted on **Render** |
 | Agents | LangGraph, `@langchain/google-genai` — package `@agentguard/agents` (npm workspace) |
 | Database | CockroachDB Cloud |
 | Embeddings | `gemini-embedding-001` via `@google/generative-ai` (3072-dim) |
-| LLM | `gemini-flash-latest` via `@langchain/google-genai` (pinned to the `-latest` alias — see gotchas below) |
+| LLM | `gemini-flash-latest` via `@langchain/google-genai` (pinned to the `-latest` alias — see gotchas) |
 | Cloud infra | AWS Lambda (`infra/lambda/`) via `@aws-sdk/client-lambda`; CockroachDB `ccloud` CLI shelled out from the Ops agent |
 | Auth | Supabase |
 | Shared DB package | `@agentguard/db` (npm workspace) |
@@ -84,11 +130,11 @@ agentguard/
 │       └── src/
 │           ├── tools.ts               # search_similar_incidents LangChain tool
 │           ├── diagnosisAgent.ts      # single diagnosis agent
-│           ├── diagnosisGraph.ts      # concurrent diagnosis subgraph (Phase 2)
+│           ├── diagnosisGraph.ts      # concurrent diagnosis subgraph
 │           ├── policy.ts              # Cost/Policy agent
 │           ├── opsAgent.ts            # Ops/Capacity agent — real ccloud CLI call
 │           ├── remediationAgent.ts    # single remediation agent
-│           ├── remediationGraph.ts    # concurrent remediation subgraph (Phase 3)
+│           ├── remediationGraph.ts    # concurrent remediation subgraph
 │           ├── awsRemediator.ts       # applies + verifies a real fix on the pod-worker Lambda
 │           ├── consistencyChecker.ts  # independent post-hoc audit of DB invariants
 │           ├── benchmark.ts           # diagnosis benchmark (npm run benchmark:diagnosis)
@@ -97,7 +143,7 @@ agentguard/
 ├── apps/
 │   ├── backend/             # Express API — thin HTTP layer over @agentguard/agents + @agentguard/db
 │   │   └── src/
-│   │       ├── index.ts
+│   │       ├── index.ts               # CORS_ORIGIN-aware CORS setup
 │   │       ├── api/routes.ts
 │   │       ├── aws/lambdaInvoker.ts   # invokes the real pod-worker Lambda for the chaos demo
 │   │       └── embeddings/seed.ts     # seeds 15 past incidents + budgets
@@ -105,6 +151,7 @@ agentguard/
 │   │   └── src/
 │   │       ├── App.tsx      # landing page + incident console + live agent-race visualizer
 │   │       ├── Auth.tsx     # Supabase email/password sign in / sign up
+│   │       ├── api.ts       # apiUrl() — prefixes fetches with VITE_API_URL in production
 │   │       └── supabase.ts
 │   └── simulator/           # Pod failure event generator
 │       └── src/index.ts
@@ -122,14 +169,14 @@ agentguard/
 
 - **Node.js 20+** — `node --version`
 - **CockroachDB Cloud account** — [cockroachlabs.cloud](https://cockroachlabs.cloud) (free tier works)
-- **Google AI Studio account** — [aistudio.google.com](https://aistudio.google.com) for Gemini API key
+- **Google AI Studio account** — [aistudio.google.com](https://aistudio.google.com) for a Gemini API key
 - **Supabase account** — [supabase.com](https://supabase.com) (free tier works)
 - **AWS account with the CLI configured** (`aws configure` or SSO) — only needed for the Lambda chaos demo (`npm run lambda:deploy`, the "Invoke →" buttons). Everything else runs without it.
 - **`ccloud` CLI, installed and authenticated** (optional) — the Ops agent's capacity check degrades gracefully to "available" if it's missing, so this is not required to run the app.
 
 ---
 
-## Setup
+## Local Setup
 
 ### 1. Clone and install
 
@@ -139,13 +186,15 @@ cd agentguard
 npm install
 ```
 
-### 2. Configure environment variables
+This is an **npm workspaces monorepo** (`packages/*` + `apps/*`) — a single `npm install` at the repo root links everything.
+
+### 2. Configure the root environment variables
 
 ```bash
 cp .env.example .env
 ```
 
-Fill in the root `.env` with your actual values:
+Fill in `.env` at the repo root:
 
 | Variable | Where to get it |
 |---|---|
@@ -153,18 +202,27 @@ Fill in the root `.env` with your actual values:
 | `COCKROACHDB_MCP_URL`, `COCKROACHDB_MCP_API_KEY`, `COCKROACHDB_CLUSTER_ID` | Documented for future use — not currently required, MCP isn't wired into any code path yet |
 | `GOOGLE_API_KEY` | aistudio.google.com → API keys |
 | `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY` | Supabase project → Settings → API (service role is backend-only, never exposed to the frontend) |
-| `AWS_REGION` | e.g. `us-east-1` — only used by the Lambda chaos demo |
+| `AWS_REGION`, `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Only used by the Lambda chaos demo. Locally, `aws configure` also works and the SDK will pick up `~/.aws/credentials` instead |
 | `POD_WORKER_LAMBDA_NAME` | Defaults to `agentguard-pod-worker` — only change if you deployed under a different name |
 | `PORT` | Backend port, defaults to `3001` |
+| `CORS_ORIGIN` | Comma-separated allowed frontend origin(s). Leave empty for local dev (all origins allowed); required once frontend and backend are deployed on different domains |
 
-**The frontend needs its own separate `.env`**, at `apps/frontend/.env` (Vite does not read the root `.env` — see `apps/frontend/.env.local.example`):
+### 3. Configure the frontend environment variables
+
+**The frontend needs its own separate `.env`**, at `apps/frontend/.env` — Vite does not read the root `.env`.
+
+```bash
+cd apps/frontend
+cp .env.local.example .env
+```
 
 | Variable | Where to get it |
 |---|---|
 | `VITE_SUPABASE_URL` | Same as `SUPABASE_URL` above |
 | `VITE_SUPABASE_ANON_KEY` | Supabase project → Settings → API → anon public key |
+| `VITE_API_URL` | Leave **empty** for local dev — Vite proxies `/api` to `localhost:3001` (see `vite.config.ts`). Only set this for a production build against a separately-hosted backend (see [Deploying to Production](#deploying-to-production)) |
 
-### 3. Run database migrations
+### 4. Run database migrations
 
 Creates all 5 tables and the vector index in CockroachDB:
 
@@ -172,7 +230,7 @@ Creates all 5 tables and the vector index in CockroachDB:
 npm run db:migrate
 ```
 
-### 4. Seed the database
+### 5. Seed the database
 
 Seeds 15 past pod incidents (with Gemini embeddings) into `incident_memory`, and seeds per-namespace remediation budgets:
 
@@ -184,7 +242,7 @@ This takes ~30 seconds (15 Gemini embedding API calls).
 
 ---
 
-## Running the App
+## Running the App Locally
 
 ### Start the backend API
 
@@ -203,7 +261,7 @@ npm run dev:simulator
 ```
 
 **Options via environment variables:**
-```bash
+```powershell
 $env:SIMULATOR_INTERVAL_MS=2000   # event every 2 seconds
 $env:SIMULATOR_TOTAL_EVENTS=10    # stop after 10 events
 npm run dev:simulator
@@ -211,7 +269,7 @@ npm run dev:simulator
 
 ### Start the frontend dashboard
 
-Needs its own `apps/frontend/.env` first — see Setup above.
+Needs its own `apps/frontend/.env` first — see [Local Setup](#local-setup) above.
 
 ```bash
 npm run dev:frontend
@@ -228,7 +286,49 @@ npm run lambda:deploy
 
 ---
 
-## API Endpoints
+## Deploying to Production
+
+The live demo runs the frontend on **Vercel** and the backend on **Render**, as two independent services talking cross-origin. This is the setup to replicate:
+
+### Backend → Render
+
+1. Create a new **Web Service** on Render, pointed at this repo.
+2. **Root Directory:** leave blank (repo root) — the backend depends on `packages/agents` and `packages/db` via npm workspaces, so it can't build in isolation from `apps/backend` alone.
+3. **Build Command:**
+   ```
+   npm install && npm run build --workspace=apps/backend
+   ```
+4. **Start Command:**
+   ```
+   npm run start --workspace=apps/backend
+   ```
+5. **Environment variables:** everything from `.env.example` (`COCKROACHDB_CONNECTION_STRING`, `GOOGLE_API_KEY`, `SUPABASE_URL`, `SUPABASE_SERVICE_ROLE_KEY`, `AWS_*`, `PORT`), plus:
+   ```
+   CORS_ORIGIN=https://<your-frontend-domain>.vercel.app
+   ```
+6. Deploy. Verify with `curl https://<your-service>.onrender.com/api/health`.
+
+### Frontend → Vercel
+
+1. Import the repo as a new Vercel project.
+2. **Root Directory:** `apps/frontend`
+3. **Framework Preset:** Vite
+4. **Build Command:** `npm run build`
+5. **Output Directory:** `dist`
+6. **Install Command:** `npm install`
+7. **Environment variables** (Settings → Environment Variables):
+   ```
+   VITE_SUPABASE_URL=...
+   VITE_SUPABASE_ANON_KEY=...
+   VITE_API_URL=https://<your-backend-service>.onrender.com
+   ```
+8. Deploy. `VITE_*` variables are baked in at **build time** — if you add or change one after the first deploy, you must trigger a fresh deployment (redeploy, don't just save the env var) for it to take effect.
+
+Both sides need to agree with each other: the Vercel domain must be in the Render service's `CORS_ORIGIN`, and the Render URL must be in the Vercel project's `VITE_API_URL`.
+
+---
+
+## API Reference
 
 | Method | Path | Description |
 |---|---|---|
@@ -245,7 +345,7 @@ npm run lambda:deploy
 
 ---
 
-## Verify Phase 1 Is Working
+## Verifying It Works
 
 ```bash
 # 1. Check backend is up
@@ -256,92 +356,41 @@ $env:SIMULATOR_TOTAL_EVENTS=5; npm run dev:simulator
 
 # 3. Check incidents were created
 curl http://localhost:3001/api/incidents
-```
 
-In the CockroachDB Cloud SQL Shell:
-
-```sql
-SELECT count(*) FROM incident_memory;       -- 15
-SELECT namespace, budget FROM remediation_budget;
-SELECT summary FROM incident_memory LIMIT 3;
-
--- Verify vector index is used (not full scan)
-EXPLAIN SELECT summary FROM incident_memory
-ORDER BY embedding <-> '[0.1, 0.2]'::vector(3072) LIMIT 3;
-```
-
----
-
-## Build Phases
-
-| Phase | Owner | Status | What it builds |
-|---|---|---|---|
-| Phase 1 | Joshna | ✅ Complete | Shared memory foundation — DB, embeddings, simulator |
-| Phase 2 | Suba | ✅ Complete | Concurrent diagnosis + reconciliation transaction |
-| Phase 3 | Ashley | ✅ Complete | Concurrent remediation race + consistency checker + dashboard + real AWS Lambda chaos demo |
-
----
-
-## Verify Phase 2 Is Working
-
-```bash
-# Fire 8 concurrent diagnosis agents at one incident, twice — once siloed, once reconciled —
-# and print the proposed/confirmed/superseded contrast:
+# 4. Prove diagnosis reconciliation: fire 8 concurrent agents at one incident,
+#    once siloed and once reconciled, and print the proposed/confirmed/superseded contrast
 npm run benchmark:diagnosis
+
+# 5. Prove the remediation race + budget contention at fleet sizes of 10/50/100
+npm run benchmark:remediation
 ```
 
-Or against a real incident via the API:
+Or drive it through the real API:
 
 ```bash
 curl -X POST http://localhost:3001/api/incidents/simulate
 # → note the incident_id, then:
 curl -X POST http://localhost:3001/api/incidents/<incident_id>/diagnose \
-  -H "Content-Type: application/json" \
-  -d '{"agent_count": 8}'
+  -H "Content-Type: application/json" -d '{"agent_count": 8}'
 curl http://localhost:3001/api/incidents/<incident_id>/diagnoses
 ```
 
-In CockroachDB Cloud SQL Shell, confirm exactly one `CONFIRMED` diagnosis per incident:
+In the CockroachDB Cloud SQL Shell:
 
 ```sql
+-- Seed data present
+SELECT count(*) FROM incident_memory;       -- 15
+SELECT namespace, budget FROM remediation_budget;
+
+-- Vector index is actually used, not a full scan
+EXPLAIN SELECT summary FROM incident_memory
+ORDER BY embedding <-> '[0.1, 0.2]'::vector(3072) LIMIT 3;
+
+-- Exactly one CONFIRMED diagnosis per incident, never more
 SELECT incident_id, status, count(*) FROM diagnoses GROUP BY incident_id, status;
 ```
 
 ---
-
-## What Phase 2 Built
-
-- **`@agentguard/db`** (`packages/db/src/queries.ts`): `proposeDiagnosisWithReconciliation()` — the reconciliation transaction. Inside one transaction it reads whether a `CONFIRMED` diagnosis already exists for the incident, then writes the new proposal as `CONFIRMED` (none exists yet) or `SUPERSEDED` (one does). Under CockroachDB `SERIALIZABLE`, two agents racing this on the same incident can't both land `CONFIRMED` — one gets `SQLSTATE 40001` and retries via `withRetry`, and on retry correctly sees the winner and writes itself `SUPERSEDED`. `getConfirmedDiagnosis()` reads the winner back out.
-- **`@agentguard/agents`** (`packages/agents/`):
-  - **`src/tools.ts`**: `search_similar_incidents` as a real LangChain `DynamicStructuredTool`, wrapping `generateEmbedding` + `searchSimilarIncidents` against `incident_memory`.
-  - **`src/diagnosisAgent.ts`**: a single diagnosis agent — pulls similar past incidents via the tool, asks Gemini for a structured `{root_cause, confidence}`, then writes through either the reconciliation path or the naive `proposeDiagnosis()` (siloed mode, for contrast).
-  - **`src/diagnosisGraph.ts`**: the LangGraph subgraph. A `Send`-based fan-out dispatches N `diagnosis_agent` branches concurrently against the same incident; an `aggregate` node tallies CONFIRMED/SUPERSEDED/PROPOSED and flips the incident to `DIAGNOSED` once a root cause is confirmed.
-  - **`src/benchmark.ts`** (`npm run benchmark:diagnosis`): runs the same incident twice — once with reconciliation disabled (siloed: N independently-"true" root causes all sit in the table), once with it enabled (exactly 1 confirmed, rest superseded) — this is the "siloed vs. shared memory" proof point.
-  - **`src/policy.ts`**: the Cost/Policy agent's approval logic — reads the current `remediation_budget` for a namespace, estimates the cost of the confirmed fix, and returns an approve/reject decision. Read-only and advisory; Phase 3's atomic claim + write-skew transaction on `remediation_budget` is what actually commits spend.
-- **`POST /api/incidents/:id/diagnose`** and **`GET /api/incidents/:id/diagnoses`** wired in `apps/backend/src/api/routes.ts`.
-
-## What Phase 3 Built
-
-- **`@agentguard/db`** (`packages/db/src/queries.ts`):
-  - `claimIncidentForRemediation()` — the atomic claim transaction: a single conditional `UPDATE incidents SET status='REMEDIATING' WHERE status='DIAGNOSED'`. Under concurrent load, CockroachDB serializes the statements so at most one `UPDATE` matches and returns a row — every other agent's statement just updates 0 rows, no error, no retry needed.
-  - `claimRemediationBudget()` — the write-skew transaction: reads the namespace budget, decides if the draw fits, writes the deduction, all in one transaction. Concurrent draws against the same namespace produce real `SQLSTATE 40001` conflicts, caught and retried by `withRetry`, so the budget can never go negative and no draw is silently double-committed.
-- **`@agentguard/agents`**:
-  - **`src/remediationAgent.ts`**: one agent's full attempt — race the claim, losers stop (REJECTED, no budget touched); the winner checks capacity, estimates cost from the confirmed root cause, races the budget draw, then executes the fix (and the real AWS fix, if applicable) and resolves the incident.
-  - **`src/remediationGraph.ts`**: the concurrent remediation subgraph — same `Send`-based fan-out pattern as `diagnosisGraph.ts`, N `remediation_agent` branches racing the same incident.
-  - **`src/opsAgent.ts`**: the Ops/Capacity agent — shells out to the real `ccloud` CLI (`ccloud cluster describe`) as an advisory pre-remediation check; degrades to "available" if `ccloud` isn't installed/authenticated rather than blocking the demo.
-  - **`src/consistencyChecker.ts`**: an independent post-hoc audit — never trusts an agent's own return value, only what's actually in the tables. Flags multiple `CONFIRMED` diagnoses, multiple `COMMITTED` remediations, negative budgets, and incidents stuck mid-flow.
-  - **`src/remediationBenchmark.ts`** (`npm run benchmark:remediation`): runs the claim race and the budget-contention race at fleet sizes of 10/50/100, with a consistency check after each run.
-- **`POST /api/incidents/:id/remediate`**, **`GET /api/incidents/:id/actions`**, **`GET /api/incidents/:id/consistency`**, **`GET /api/consistency`** wired in `apps/backend/src/api/routes.ts`.
-- **The dashboard** (`apps/frontend/src/App.tsx`, `Auth.tsx`): Supabase auth, an incident console, a live "agent race" panel that reveals each of the 8 agents' verdicts as they land, a workflow stepper, the confirmed-root-cause and committed-action callouts, and the consistency-audit panel.
-
-## The AWS Lambda Chaos Demo
-
-This is what makes AWS load-bearing rather than decorative:
-
-- **`infra/lambda/pod-worker/handler.js`** — a real Lambda function (128MB memory, 5s timeout) standing in for a pod's container process. Invoking it with `failureMode: 'crash-loop' | 'oom' | 'timeout'` causes a **genuine** AWS failure (a real container OOM kill, a real `Sandbox.Timedout`), not a simulated string.
-- **`infra/lambda/deploy.sh`** (`npm run lambda:deploy`) — creates/updates the function and resets it to baseline config each deploy, so the demo is repeatable.
-- **`apps/backend/src/aws/lambdaInvoker.ts`** — invokes the real function from the `POST /api/incidents/lambda-invoke` route; a real crash becomes a real incident, with the actual Lambda `requestId` and error as its symptom text.
-- **`packages/agents/src/awsRemediator.ts`** — when remediation commits for a Lambda-originated incident, it makes a **real `UpdateFunctionConfiguration` call** (raises memory, raises timeout, or sets a hotfix env var) based on the confirmed root cause, waits for AWS to finish applying it, then **re-invokes the same function with the same failure mode to prove the fix actually holds** — not a DB status flip, an inspectable AWS API call plus verified proof.
 
 ## Known Gotchas
 
@@ -350,4 +399,6 @@ This is what makes AWS load-bearing rather than decorative:
 - An incident is only `DIAGNOSED` once `runConcurrentDiagnosis()` confirms a root cause, and only `RESOLVED` once remediation commits — the frontend's workflow stepper reflects this directly from `incidents.status`.
 - **Chat model is pinned to `gemini-flash-latest`** in `packages/agents/src/diagnosisAgent.ts`. Google deprecates concrete Gemini model IDs on a rolling basis without much notice (`gemini-2.0-flash`, then `gemini-2.5-flash`, both returned hard 404s during development) — the `-latest` alias avoids re-breaking this. If you ever get a 404 from a `ChatGoogleGenerativeAI` call, check `GET https://generativelanguage.googleapis.com/v1beta/models?key=$GOOGLE_API_KEY` for what's currently live before assuming your code is broken.
 - **If you add a new LangChain tool and `tsc` fails with `TS2589: Type instantiation is excessively deep`**: this project's TS/zod/`@langchain/core` combination chokes on `DynamicStructuredTool`'s generic inference from a `ZodObject`. Do **not** "fix" it by pinning zod below 3.25 in `package.json` `overrides` — that resolves the type error but breaks at runtime (`@langchain/google-genai` does `require('zod/v3')`, a subpath export zod only added in 3.24+; this was tried and reverted). The actual fix, used in `packages/agents/src/tools.ts`: give your `func` an explicit param type and cast `schema: yourSchema as any` in the `DynamicStructuredTool` constructor — no runtime change, zod still validates normally, it just stops TS from trying to unify the schema's inferred type with `func`'s signature.
-- The frontend needs its **own** `.env` at `apps/frontend/.env` (Vite doesn't read the root one) — see Setup above.
+- The frontend needs its **own** `.env` at `apps/frontend/.env` (Vite doesn't read the root one).
+- **`VITE_*` variables are baked in at build time, not read at runtime.** Changing `VITE_API_URL` (or any `VITE_*` var) in Vercel's dashboard does nothing until you trigger a new deployment — saving the env var alone does not affect an already-built bundle.
+- **CORS must be configured on both ends before the deployed dashboard can reach the deployed API.** If the frontend origin isn't in the backend's `CORS_ORIGIN`, requests will fail in the browser even though `curl` against the same endpoint succeeds (curl doesn't enforce CORS).
