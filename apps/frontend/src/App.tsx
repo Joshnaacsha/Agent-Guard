@@ -2,6 +2,7 @@ import { useEffect, useState, useCallback } from 'react';
 import type { Session } from '@supabase/supabase-js';
 import { supabase } from './supabase';
 import Auth from './Auth';
+import { apiUrl } from './api';
 
 /* ── theme tokens ───────────────────────────────────────────── */
 const C = {
@@ -748,15 +749,15 @@ function App() {
   }, []);
 
   const refreshIncidents = useCallback(async () => {
-    const r = await fetch('/api/incidents');
+    const r = await fetch(apiUrl('/api/incidents'));
     setIncidents(await r.json());
   }, []);
 
   const refreshSelected = useCallback(async (id: string) => {
     const [diagRes, actionsRes, consistencyRes] = await Promise.all([
-      fetch(`/api/incidents/${id}/diagnoses`),
-      fetch(`/api/incidents/${id}/actions`),
-      fetch(`/api/incidents/${id}/consistency`),
+      fetch(apiUrl(`/api/incidents/${id}/diagnoses`)),
+      fetch(apiUrl(`/api/incidents/${id}/actions`)),
+      fetch(apiUrl(`/api/incidents/${id}/consistency`)),
     ]);
     setDiagnoses(await diagRes.json());
     setActions(await actionsRes.json());
@@ -764,7 +765,7 @@ function App() {
   }, []);
 
   useEffect(() => {
-    fetch('/api/health')
+    fetch(apiUrl('/api/health'))
       .then((r) => r.json())
       .then(() => setBackendOk(true))
       .catch(() => setBackendOk(false));
@@ -799,7 +800,7 @@ function App() {
 
   async function handleSimulate() {
     const incident = await runAction('simulate', () =>
-      fetch('/api/incidents/simulate', { method: 'POST' })
+      fetch(apiUrl('/api/incidents/simulate'), { method: 'POST' })
     );
     if (incident) { await refreshIncidents(); setSelectedId(incident.incident_id); }
   }
@@ -808,7 +809,7 @@ function App() {
     if (lambdaBusy !== null) return; // belt-and-suspenders: the disabled attribute already blocks this
     setLambdaBusy(mode); setError(null); setLambdaResult(null);
     try {
-      const res = await fetch('/api/incidents/lambda-invoke', {
+      const res = await fetch(apiUrl('/api/incidents/lambda-invoke'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ failure_mode: mode }),
@@ -834,7 +835,7 @@ function App() {
     if (!selectedId) return;
     const lambdaSymptom = lambdaResult?.incident?.incident_id === selectedId ? lambdaResult.symptom : null;
     const body = await runAction('diagnose', () =>
-      fetch(`/api/incidents/${selectedId}/diagnose`, {
+      fetch(apiUrl(`/api/incidents/${selectedId}/diagnose`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agent_count: 8, reconcile: true, ...(lambdaSymptom ? { symptom: lambdaSymptom } : {}) }),
@@ -850,7 +851,7 @@ function App() {
   async function handleRemediate() {
     if (!selectedId) return;
     const body = await runAction('remediate', () =>
-      fetch(`/api/incidents/${selectedId}/remediate`, {
+      fetch(apiUrl(`/api/incidents/${selectedId}/remediate`), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ agent_count: 8 }),
