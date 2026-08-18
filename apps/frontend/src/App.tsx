@@ -1,4 +1,7 @@
 import { useEffect, useState, useCallback } from 'react';
+import type { Session } from '@supabase/supabase-js';
+import { supabase } from './supabase';
+import Auth from './Auth';
 
 /* ── theme tokens ───────────────────────────────────────────── */
 const C = {
@@ -451,7 +454,7 @@ function AgentRace({
 }
 
 /* ── landing page ───────────────────────────────────────────── */
-function LandingPage({ onEnter }: { onEnter: () => void }) {
+function LandingPage({ onEnter, session, onSignIn }: { onEnter: () => void; session: Session | null; onSignIn: () => void }) {
   const features = [
     {
       abbr: 'SM',
@@ -515,14 +518,26 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 12, alignItems: 'center' }}>
           <a href="https://github.com/Joshnaacsha/Agent-Guard" target="_blank" rel="noreferrer"
             style={{ fontSize: 13, color: C.muted, textDecoration: 'none' }}>GitHub</a>
-          <button
-            onClick={onEnter}
-            style={{
-              background: C.blue, color: '#0d1117',
-              border: 'none', borderRadius: 8, padding: '8px 22px',
-              fontWeight: 700, fontSize: 14, cursor: 'pointer', fontFamily: 'inherit',
-            }}
-          >Open Console</button>
+          {session ? (
+            <>
+              <span style={{ fontSize: 13, color: C.muted, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                {session.user.email}
+              </span>
+              <button
+                onClick={() => supabase.auth.signOut()}
+                style={{ background: 'none', border: `1px solid ${C.border}`, borderRadius: 6, color: C.muted, cursor: 'pointer', fontSize: 12, padding: '5px 12px', fontFamily: 'inherit' }}
+              >Sign out</button>
+              <button
+                onClick={onEnter}
+                style={{ background: C.blue, color: '#0d1117', border: 'none', borderRadius: 8, padding: '8px 22px', fontWeight: 700, fontSize: 14, cursor: 'pointer', fontFamily: 'inherit' }}
+              >Open Console</button>
+            </>
+          ) : (
+            <button
+              onClick={onSignIn}
+              style={{ background: C.blue, color: '#0d1117', border: 'none', borderRadius: 8, padding: '8px 22px', fontWeight: 700, fontSize: 14, cursor: 'pointer', fontFamily: 'inherit' }}
+            >Sign In</button>
+          )}
         </div>
       </nav>
 
@@ -549,30 +564,20 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
         </p>
 
         <div style={{ display: 'flex', gap: 12, justifyContent: 'center', flexWrap: 'wrap' }}>
-          <button
-            onClick={onEnter}
-            style={{
-              background: C.blue, color: '#0d1117', border: 'none',
-              borderRadius: 10, padding: '14px 32px', fontWeight: 800,
-              fontSize: 16, cursor: 'pointer', fontFamily: 'inherit',
-            }}
-          >
-            Launch Dashboard →
-          </button>
-          <a
-            href="https://github.com/Joshnaacsha/Agent-Guard"
-            target="_blank"
-            rel="noreferrer"
-            style={{
-              background: 'transparent', color: C.text,
-              border: `1px solid ${C.border}`,
-              borderRadius: 10, padding: '14px 32px', fontWeight: 600,
-              fontSize: 16, cursor: 'pointer', fontFamily: 'inherit',
-              textDecoration: 'none', display: 'inline-block',
-            }}
-          >
-            GitHub ↗
-          </a>
+          {session ? (
+            <button
+              onClick={onEnter}
+              style={{ background: C.blue, color: '#0d1117', border: 'none', borderRadius: 10, padding: '14px 32px', fontWeight: 800, fontSize: 16, cursor: 'pointer', fontFamily: 'inherit' }}
+            >Launch Dashboard →</button>
+          ) : (
+            <button
+              onClick={onSignIn}
+              style={{ background: C.blue, color: '#0d1117', border: 'none', borderRadius: 10, padding: '14px 32px', fontWeight: 800, fontSize: 16, cursor: 'pointer', fontFamily: 'inherit' }}
+            >Sign In →</button>
+          )}
+          <a href="https://github.com/Joshnaacsha/Agent-Guard" target="_blank" rel="noreferrer"
+            style={{ background: 'transparent', color: C.text, border: `1px solid ${C.border}`, borderRadius: 10, padding: '14px 32px', fontWeight: 600, fontSize: 16, textDecoration: 'none', display: 'inline-block' }}
+          >GitHub ↗</a>
         </div>
       </div>
 
@@ -690,16 +695,17 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
         <p style={{ color: C.muted, marginBottom: '2rem', fontSize: 15 }}>
           Simulate a pod failure, watch 8 agents diagnose it concurrently, see reconciliation happen live.
         </p>
-        <button
-          onClick={onEnter}
-          style={{
-            background: C.blue, color: '#0d1117', border: 'none',
-            borderRadius: 10, padding: '14px 36px', fontWeight: 800,
-            fontSize: 16, cursor: 'pointer', fontFamily: 'inherit',
-          }}
-        >
-          Open Console
-        </button>
+        {session ? (
+          <button
+            onClick={onEnter}
+            style={{ background: C.blue, color: '#0d1117', border: 'none', borderRadius: 10, padding: '14px 36px', fontWeight: 800, fontSize: 16, cursor: 'pointer', fontFamily: 'inherit' }}
+          >Open Console</button>
+        ) : (
+          <button
+            onClick={onSignIn}
+            style={{ background: C.blue, color: '#0d1117', border: 'none', borderRadius: 10, padding: '14px 36px', fontWeight: 800, fontSize: 16, cursor: 'pointer', fontFamily: 'inherit' }}
+          >Sign In</button>
+        )}
       </div>
     </div>
   );
@@ -707,8 +713,11 @@ function LandingPage({ onEnter }: { onEnter: () => void }) {
 
 /* ── main app ───────────────────────────────────────────────── */
 function App() {
+  const [session, setSession]         = useState<Session | null>(null);
+  const [authLoading, setAuthLoading] = useState(true);
   const [showLanding, setShowLanding] = useState(true);
-  const [backendOk, setBackendOk] = useState(false);
+  const [showAuth, setShowAuth]       = useState(false);
+  const [backendOk, setBackendOk]     = useState(false);
   const [incidents, setIncidents] = useState<Incident[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [diagnoses, setDiagnoses] = useState<Diagnosis[]>([]);
@@ -722,6 +731,20 @@ function App() {
   const [error, setError] = useState<string | null>(null);
   const [lambdaBusy, setLambdaBusy] = useState<LambdaFailureMode | null>(null);
   const [lambdaResult, setLambdaResult] = useState<LambdaInvokeResponse | null>(null);
+
+  useEffect(() => {
+    supabase.auth.getSession().then(({ data }) => {
+      setSession(data.session);
+      if (data.session) setShowLanding(false); // restore dashboard on page refresh
+      setAuthLoading(false);
+    });
+    const { data: { subscription } } = supabase.auth.onAuthStateChange((event, s) => {
+      setSession(s);
+      if (event === 'SIGNED_IN')  { setShowAuth(false); setShowLanding(false); }
+      if (event === 'SIGNED_OUT') { setShowAuth(false); setShowLanding(true);  }
+    });
+    return () => subscription.unsubscribe();
+  }, []);
 
   const refreshIncidents = useCallback(async () => {
     const r = await fetch('/api/incidents');
@@ -842,7 +865,14 @@ function App() {
   const selected = incidents.find((i) => i.incident_id === selectedId) ?? null;
   const sm = statusMeta[selected?.status ?? ''] ?? { color: C.muted, label: selected?.status ?? '' };
 
-  if (showLanding) return <LandingPage onEnter={() => setShowLanding(false)} />;
+  if (authLoading) return (
+    <div style={{ minHeight: '100vh', background: '#0d1117', display: 'flex', alignItems: 'center', justifyContent: 'center', color: '#8b949e', fontSize: 13 }}>
+      Loading…
+    </div>
+  );
+  if (!session && showAuth) return <Auth onBack={() => setShowAuth(false)} />;
+  if (showLanding) return <LandingPage onEnter={() => setShowLanding(false)} session={session} onSignIn={() => setShowAuth(true)} />;
+  if (!session)    return <LandingPage onEnter={() => setShowLanding(false)} session={null}    onSignIn={() => setShowAuth(true)} />;
 
   return (
     <div style={{
@@ -885,6 +915,18 @@ function App() {
             <div style={{ width: 7, height: 7, borderRadius: '50%', background: backendOk ? C.green : C.red }} />
             <span style={{ fontSize: 12, color: C.muted }}>{backendOk ? 'Connected' : 'Offline'}</span>
           </div>
+          <div style={{ width: 1, height: 16, background: C.border }} />
+          <span style={{ fontSize: 12, color: C.muted, maxWidth: 160, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {session?.user.email}
+          </span>
+          <button
+            onClick={() => supabase.auth.signOut()}
+            style={{
+              background: 'none', border: `1px solid ${C.border}`, borderRadius: 5,
+              color: C.muted, cursor: 'pointer', fontSize: 12, padding: '3px 10px',
+              fontFamily: 'inherit', transition: 'border-color 0.15s, color 0.15s',
+            }}
+          >Sign out</button>
         </div>
       </div>
 
