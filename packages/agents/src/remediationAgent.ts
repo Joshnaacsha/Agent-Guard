@@ -40,7 +40,7 @@ export async function runRemediationAgent(input: RemediationAgentInput): Promise
       agentId,
       incidentId: incident.incident_id,
       outcome: 'REJECTED',
-      reason: 'Lost the claim race — another agent is already remediating this incident.',
+      reason: 'Lost the claim race - another agent is already remediating this incident.',
       action: null,
       cost: null,
       retries: 0,
