@@ -1,12 +1,13 @@
 import { getRemediationBudget } from '@agentguard/db';
 
-export type RemediationAction = 'restart' | 'rollback' | 'scale-up' | 'config-fix';
+export type RemediationAction = 'restart' | 'rollback' | 'scale-up' | 'config-fix' | 'timeout-fix';
 
 const ACTION_COST_TABLE: Record<RemediationAction, number> = {
   restart: 50,
   rollback: 300,
   'scale-up': 500,
   'config-fix': 20,
+  'timeout-fix': 80,
 };
 
 export interface RemediationCostEstimate {
@@ -21,6 +22,8 @@ export function estimateRemediationCost(rootCause: string): RemediationCostEstim
 
   if (lower.includes('rollback') || lower.includes('bad deploy') || lower.includes('regression') || lower.includes('bad image')) {
     action = 'rollback';
+  } else if (lower.includes('timed out') || lower.includes('timeout') || lower.includes('sandbox.timedout')) {
+    action = 'timeout-fix';
   } else if (lower.includes('memory') || lower.includes('oom') || lower.includes('capacity') || lower.includes('scale') || lower.includes('gpu')) {
     action = 'scale-up';
   } else if (lower.includes('config') || lower.includes('secret') || lower.includes('env') || lower.includes('credential')) {

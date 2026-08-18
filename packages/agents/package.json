@@ -11,6 +11,7 @@
   },
   "dependencies": {
     "@agentguard/db": "*",
+    "@aws-sdk/client-lambda": "^3.600.0",
     "@google/generative-ai": "^0.24.0",
     "@langchain/core": "^0.3.0",
     "@langchain/google-genai": "^0.1.0",

@@ -4,6 +4,7 @@ import {
   runConcurrentDiagnosis, evaluateRemediationPolicy, defaultSymptomFor,
   runConcurrentRemediation, checkIncidentConsistency, checkFleetConsistency,
 } from '@agentguard/agents';
+import { invokePodWorker, type PodFailureMode } from '../aws/lambdaInvoker';
 
 export const router = Router();
 
@@ -28,6 +29,39 @@ router.post('/incidents/simulate', async (req, res) => {
     res.status(201).json(incident);
   } catch (err) {
     res.status(500).json({ error: 'Failed to create incident' });
+  }
+});
+
+// AWS Lambda chaos demo: invokes the real agentguard-pod-worker Lambda function (see
+// infra/lambda/), which stands in for a pod's container process. A genuine AWS crash/OOM/
+// timeout becomes a real incident, fed with the actual Lambda requestId + error as its symptom.
+const VALID_FAILURE_MODES: PodFailureMode[] = ['healthy', 'crash-loop', 'oom', 'timeout'];
+
+router.post('/incidents/lambda-invoke', async (req, res) => {
+  try {
+    const podName = req.body?.pod_name ?? `lambda-pod-${Math.random().toString(36).substring(2, 8)}`;
+    const namespace = req.body?.namespace ?? 'production';
+    const failureMode: PodFailureMode = VALID_FAILURE_MODES.includes(req.body?.failure_mode)
+      ? req.body.failure_mode
+      : 'crash-loop';
+
+    const invocation = await invokePodWorker(podName, namespace, failureMode);
+
+    if (invocation.ok) {
+      res.json({ ok: true, invocation, incident: null, symptom: null });
+      return;
+    }
+
+    const incident = await createIncident(podName, namespace);
+    const symptom =
+      `Pod ${podName} in namespace ${namespace} crashed when its container was invoked as the real ` +
+      `AWS Lambda function agentguard-pod-worker (RequestId ${invocation.requestId}, ${invocation.durationMs}ms): ` +
+      `${invocation.errorType ?? 'Error'} — ${invocation.errorMessage ?? 'unknown error'}.`;
+
+    res.status(201).json({ ok: false, invocation, incident, symptom });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'Failed to invoke pod worker Lambda — check AWS credentials and that agentguard-pod-worker is deployed' });
   }
 });
 

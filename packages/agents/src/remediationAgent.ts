@@ -5,6 +5,7 @@ import {
 } from '@agentguard/db';
 import { estimateRemediationCost, type RemediationAction } from './policy';
 import { checkClusterCapacity } from './opsAgent';
+import { applyAwsFix, isLambdaOriginatedIncident, type AwsFixResult } from './awsRemediator';
 
 export interface RemediationAgentInput {
   incident: Incident;
@@ -19,6 +20,8 @@ export interface RemediationAgentResult {
   action: RemediationAction | null;
   cost: number | null;
   retries: number;
+  /** set only when the incident came from a real Lambda invocation and a real AWS fix was attempted */
+  awsFix: AwsFixResult | null;
 }
 
 /**
@@ -44,6 +47,7 @@ export async function runRemediationAgent(input: RemediationAgentInput): Promise
       action: null,
       cost: null,
       retries: 0,
+      awsFix: null,
     };
   }
 
@@ -76,7 +80,22 @@ export async function runRemediationAgent(input: RemediationAgentInput): Promise
       action,
       cost: estimatedCost,
       retries,
+      awsFix: null,
     };
+  }
+
+  // If this incident came from a real pod-worker Lambda crash, actually fix the Lambda —
+  // real UpdateFunctionConfiguration call, then a real re-invocation proving it now succeeds —
+  // instead of only flipping the incident's status in the database.
+  let awsFix: AwsFixResult | null = null;
+  if (isLambdaOriginatedIncident(incident.pod_name)) {
+    awsFix = await applyAwsFix(action);
+    await logAgentAction(
+      incident.incident_id,
+      agentId,
+      `aws_fix:${action}${awsFix.verified === false ? ':unverified' : ''}`,
+      awsFix.applied && awsFix.verified !== false ? 'COMMITTED' : 'REJECTED'
+    );
   }
 
   await resolveIncident(incident.incident_id);
@@ -86,9 +105,11 @@ export async function runRemediationAgent(input: RemediationAgentInput): Promise
     agentId,
     incidentId: incident.incident_id,
     outcome: 'COMMITTED',
-    reason: `Executed '${action}' for $${estimatedCost}; $${remainingBudget} left in ${incident.namespace}.`,
+    reason: `Executed '${action}' for $${estimatedCost}; $${remainingBudget} left in ${incident.namespace}.` +
+      (awsFix ? ` AWS: ${awsFix.detail}${awsFix.verified === true ? ' Verified fixed.' : awsFix.verified === false ? ' Re-invoke still failed.' : ''}` : ''),
     action,
     cost: estimatedCost,
     retries,
+    awsFix,
   };
 }

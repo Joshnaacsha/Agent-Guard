@@ -13,7 +13,8 @@
     "db:migrate": "npm run migrate --workspace=packages/db",
     "seed": "npm run seed --workspace=apps/backend",
     "benchmark:diagnosis": "npm run benchmark:diagnosis --workspace=packages/agents",
-    "benchmark:remediation": "npm run benchmark:remediation --workspace=packages/agents"
+    "benchmark:remediation": "npm run benchmark:remediation --workspace=packages/agents",
+    "lambda:deploy": "bash infra/lambda/deploy.sh"
   },
   "devDependencies": {
     "typescript": "^5.4.0"

@@ -1,6 +1,7 @@
 import { StateGraph, Annotation, Send, START, END } from '@langchain/langgraph';
 import type { Incident } from '@agentguard/db';
 import { runRemediationAgent, type RemediationAgentResult } from './remediationAgent';
+import type { AwsFixResult } from './awsRemediator';
 
 export interface RemediationSummary {
   incidentId: string;
@@ -10,6 +11,7 @@ export interface RemediationSummary {
   retriedActions: number;
   committedAction: string | null;
   committedCost: number | null;
+  committedAwsFix: AwsFixResult | null;
 }
 
 const RemediationGraphState = Annotation.Root({
@@ -58,6 +60,7 @@ async function aggregateNode(state: RemediationState): Promise<Partial<Remediati
     retriedActions,
     committedAction: committed[0]?.action ?? null,
     committedCost: committed[0]?.cost ?? null,
+    committedAwsFix: committed[0]?.awsFix ?? null,
   };
 
   return { summary };

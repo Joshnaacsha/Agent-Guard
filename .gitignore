@@ -8,3 +8,4 @@ Thumbs.db
 *.log
 npm-debug.log*
 coverage/
+*.zip

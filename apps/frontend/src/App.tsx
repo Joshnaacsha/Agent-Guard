@@ -65,6 +65,12 @@ interface DiagnosisSummary {
   confirmedRootCause: string | null;
 }
 
+interface AwsFixResult {
+  applied: boolean;
+  detail: string;
+  verified: boolean | null;
+}
+
 interface RemediationSummary {
   agentCount: number;
   committed: number;
@@ -72,6 +78,7 @@ interface RemediationSummary {
   retriedActions: number;
   committedAction: string | null;
   committedCost: number | null;
+  committedAwsFix: AwsFixResult | null;
 }
 
 interface ConsistencyIssue {
@@ -98,6 +105,24 @@ interface RemediationAgentResult {
   action: string | null;
   cost: number | null;
   retries: number;
+}
+
+type LambdaFailureMode = 'healthy' | 'crash-loop' | 'oom' | 'timeout';
+
+interface LambdaInvocation {
+  ok: boolean;
+  requestId: string;
+  durationMs: number;
+  failureMode: LambdaFailureMode;
+  errorType?: string;
+  errorMessage?: string;
+}
+
+interface LambdaInvokeResponse {
+  ok: boolean;
+  invocation: LambdaInvocation;
+  incident: Incident | null;
+  symptom: string | null;
 }
 
 /* inject keyframes once at module level */
@@ -695,6 +720,8 @@ function App() {
   const [consistency, setConsistency] = useState<ConsistencyReport | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [lambdaBusy, setLambdaBusy] = useState<LambdaFailureMode | null>(null);
+  const [lambdaResult, setLambdaResult] = useState<LambdaInvokeResponse | null>(null);
 
   const refreshIncidents = useCallback(async () => {
     const r = await fetch('/api/incidents');
@@ -753,13 +780,39 @@ function App() {
     if (incident) { await refreshIncidents(); setSelectedId(incident.incident_id); }
   }
 
+  async function handleLambdaInvoke(mode: LambdaFailureMode) {
+    setLambdaBusy(mode); setError(null); setLambdaResult(null);
+    try {
+      const res = await fetch('/api/incidents/lambda-invoke', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ failure_mode: mode }),
+      });
+      const body: LambdaInvokeResponse | { error: string } = await res.json();
+      if (!res.ok) throw new Error((body as { error: string }).error ?? 'Lambda invocation failed');
+      const result = body as LambdaInvokeResponse;
+      setLambdaResult(result);
+      if (result.incident) {
+        await refreshIncidents();
+        setSelectedId(result.incident.incident_id);
+      }
+    } catch (err: any) {
+      setError(err.message ?? String(err));
+    } finally {
+      setLambdaBusy(null);
+    }
+  }
+
+  // Real Lambda-crash incidents carry their actual AWS error as the diagnosis symptom instead
+  // of the synthetic defaultSymptomFor() text — the agents investigate what genuinely happened.
   async function handleDiagnose() {
     if (!selectedId) return;
+    const lambdaSymptom = lambdaResult?.incident?.incident_id === selectedId ? lambdaResult.symptom : null;
     const body = await runAction('diagnose', () =>
       fetch(`/api/incidents/${selectedId}/diagnose`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ agent_count: 8, reconcile: true }),
+        body: JSON.stringify({ agent_count: 8, reconcile: true, ...(lambdaSymptom ? { symptom: lambdaSymptom } : {}) }),
       })
     );
     if (body) {
@@ -847,6 +900,33 @@ function App() {
               {busy === 'simulate' ? 'Creating…' : '+ Simulate'}
             </Btn>
             <Btn onClick={refreshIncidents} disabled={busy !== null}>Refresh</Btn>
+          </div>
+
+          <div style={{ padding: '1rem', borderBottom: `1px solid ${C.border}` }}>
+            <div style={{ fontSize: 10, fontWeight: 700, color: C.muted, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 8 }}>
+              AWS Lambda — real pod workload
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              <Btn onClick={() => handleLambdaInvoke('crash-loop')} disabled={lambdaBusy !== null} variant="danger">
+                {lambdaBusy === 'crash-loop' ? 'Invoking…' : 'Invoke → Crash'}
+              </Btn>
+              <Btn onClick={() => handleLambdaInvoke('oom')} disabled={lambdaBusy !== null} variant="danger">
+                {lambdaBusy === 'oom' ? 'Invoking…' : 'Invoke → OOM Kill'}
+              </Btn>
+              <Btn onClick={() => handleLambdaInvoke('timeout')} disabled={lambdaBusy !== null} variant="danger">
+                {lambdaBusy === 'timeout' ? 'Invoking (~5s)…' : 'Invoke → Timeout'}
+              </Btn>
+            </div>
+            {lambdaResult && (
+              <div style={{ marginTop: 10, fontSize: 11, lineHeight: 1.6 }}>
+                <div style={{ color: lambdaResult.ok ? C.green : C.red, fontWeight: 700 }}>
+                  {lambdaResult.ok ? 'Ran fine — no crash' : `${lambdaResult.invocation.errorType ?? 'Crashed'}`}
+                </div>
+                <div style={{ color: C.muted }}>
+                  RequestId {lambdaResult.invocation.requestId.substring(0, 8)} · {lambdaResult.invocation.durationMs}ms
+                </div>
+              </div>
+            )}
           </div>
 
           <div style={{ overflowY: 'auto', flex: 1 }}>
@@ -1013,6 +1093,29 @@ function App() {
                     <div style={{ fontSize: 10, color: C.muted, marginBottom: 2 }}>Cost</div>
                     <div style={{ fontWeight: 700, color: C.green }}>${remediationSummary.committedCost}</div>
                   </div>
+                </div>
+              )}
+
+              {/* real AWS fix — only present when this incident came from a real Lambda crash */}
+              {remediationSummary?.committedAwsFix && (
+                <div style={{
+                  marginBottom: '1rem',
+                  background: remediationSummary.committedAwsFix.verified ? '#0c1f10' : '#2a2010',
+                  border: `1px solid ${remediationSummary.committedAwsFix.verified ? C.green : C.yellow}`,
+                  borderRadius: 8, padding: '0.75rem 1rem', fontSize: 13,
+                }}>
+                  <div style={{
+                    fontSize: 10, fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.08em', marginBottom: 6,
+                    color: remediationSummary.committedAwsFix.verified ? C.green : C.yellow,
+                  }}>
+                    Real AWS fix {remediationSummary.committedAwsFix.verified ? '— verified' : remediationSummary.committedAwsFix.verified === false ? '— re-invoke still failing' : ''}
+                  </div>
+                  <div style={{ color: C.text, lineHeight: 1.6 }}>{remediationSummary.committedAwsFix.detail}</div>
+                  {remediationSummary.committedAwsFix.verified && (
+                    <div style={{ color: C.muted, marginTop: 4, fontSize: 12 }}>
+                      Re-invoked agentguard-pod-worker after the fix — it now returns 200 instead of crashing.
+                    </div>
+                  )}
                 </div>
               )}
 
